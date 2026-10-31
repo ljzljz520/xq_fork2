@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -687,22 +688,42 @@ func IsJSON(input string) bool {
 }
 
 func PagerPrint(reader io.Reader, writer io.Writer, pager string) error {
-	var args []string
-
 	if pager == "" {
 		_, err := io.Copy(writer, reader)
 		return err
 	}
 
+	var args []string
 	if pager == "less" {
 		args = append(args, "--quit-if-one-screen", "--no-init", "--RAW-CONTROL-CHARS")
 	}
 
 	cmd := exec.Command(pager, args...)
-	cmd.Stdin = reader
+
+	// Feed the pager through an os.Pipe instead of assigning the caller's
+	// reader directly. Otherwise exec.Command spawns a stdin copy goroutine
+	// that cmd.Wait waits for, so an early pager exit would not be reported
+	// until the reader produces more data or reaches EOF.
+	stdinReader, stdinWriter, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	cmd.Stdin = stdinReader
 	cmd.Stdout = writer
 
-	return cmd.Run()
+	go func() {
+		_, _ = io.Copy(stdinWriter, reader)
+		_ = stdinWriter.Close()
+	}()
+
+	runErr := cmd.Run()
+
+	// The pager has exited: release the pipe descriptors and any blocked
+	// copy goroutine. Closing the upstream reader is the caller's job.
+	_ = stdinReader.Close()
+	_ = stdinWriter.Close()
+
+	return runErr
 }
 
 func getTokenFullName(name xml.Name, nsAliases map[string]string) string {

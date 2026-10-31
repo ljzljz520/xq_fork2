@@ -3,10 +3,14 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/antchfx/xmlquery"
 	"github.com/sibprogrammer/xq/internal/utils"
@@ -239,5 +243,83 @@ Bye.`,
 				assert.Equal(t, tt.expected, resultMap)
 			}
 		})
+	}
+}
+
+func TestProcessingErrorIsNotMaskedByLaterSuccess(t *testing.T) {
+	badFile := filepath.Join(t.TempDir(), "bad.xml")
+	assert.NoError(t, os.WriteFile(badFile, []byte("<root><unclosed>"), 0600))
+
+	goodFile := filepath.Join("..", "test", "data", "xml", "formatted.xml")
+
+	command := NewRootCmd()
+	InitFlags(command)
+
+	output, err := execute(command, "--no-pager", badFile, goodFile)
+
+	assert.Error(t, err)
+	assert.Contains(t, output, "Error:")
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) {
+	return 0, errors.New("simulated downstream write failure")
+}
+
+func TestDownstreamWriteFailureStopsProducer(t *testing.T) {
+	command := NewRootCmd()
+	InitFlags(command)
+
+	errBuf := new(bytes.Buffer)
+	command.SetOut(failingWriter{})
+	command.SetErr(errBuf)
+	command.SetArgs([]string{"--no-pager", filepath.Join("..", "test", "data", "xml", "formatted.xml")})
+
+	done := make(chan error, 1)
+	go func() {
+		done <- command.Execute()
+	}()
+
+	select {
+	case err := <-done:
+		assert.ErrorContains(t, err, "simulated downstream write failure")
+	case <-time.After(5 * time.Second):
+		t.Fatal("command hung after the downstream writer failed")
+	}
+}
+
+func TestPagerEarlyExitWithUnfinishedInput(t *testing.T) {
+	t.Setenv("XQ_PAGER", "true")
+
+	command := NewRootCmd()
+	InitFlags(command)
+
+	// The input pipe is never closed and only carries a partial document:
+	// the input stream has not ended when the pager exits.
+	inReader, inWriter := io.Pipe()
+	defer func() { _ = inWriter.Close() }()
+	go func() {
+		_, _ = inWriter.Write([]byte("<abc>"))
+	}()
+
+	outBuf := new(bytes.Buffer)
+	errBuf := new(bytes.Buffer)
+	command.SetIn(inReader)
+	command.SetOut(outBuf)
+	command.SetErr(errBuf)
+	command.SetArgs([]string{"--no-pager=false"})
+
+	done := make(chan error, 1)
+	go func() {
+		done <- command.Execute()
+	}()
+
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+		assert.Empty(t, errBuf.String())
+	case <-time.After(5 * time.Second):
+		t.Fatal("command did not exit after the pager closed while input was still open")
 	}
 }

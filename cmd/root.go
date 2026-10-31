@@ -38,14 +38,17 @@ func NewRootCmd() *cobra.Command {
 				return err
 			}
 			if len(args) == 0 {
-				fileInfo, _ := os.Stdin.Stat()
+				stdin := cmd.InOrStdin()
 
-				if (fileInfo.Mode() & os.ModeCharDevice) != 0 {
-					_ = cmd.Help()
-					return nil
+				if stat, ok := stdin.(interface{ Stat() (os.FileInfo, error) }); ok {
+					fileInfo, _ := stat.Stat()
+					if (fileInfo.Mode() & os.ModeCharDevice) != 0 {
+						_ = cmd.Help()
+						return nil
+					}
 				}
 
-				readers = append(readers, os.Stdin)
+				readers = append(readers, stdin)
 			} else {
 				for _, fileName := range args {
 					fileNames = append(fileNames, fileName)
@@ -82,8 +85,6 @@ func NewRootCmd() *cobra.Command {
 				return errors.New("in-place formatting is incompatible with nodes selection")
 			}
 
-			pr, pw := io.Pipe()
-
 			if inPlace {
 				for i := range len(fileNames) {
 					var content []byte
@@ -108,47 +109,141 @@ func NewRootCmd() *cobra.Command {
 				return nil
 			}
 
-			matchFound := false
+			// Unified lifecycle for the normal output path. A producer
+			// goroutine processes the inputs into the pipe, while the pager
+			// drains it on the main goroutine. When the consumer finishes
+			// (pager quit early, a downstream write failure, or all the input
+			// was printed), the cancel channel is closed and the read end of
+			// the pipe is aborted, so input reading stops and the producer
+			// goroutine is always reclaimed before the command returns.
+			pr, pw := io.Pipe()
+			cancel := make(chan struct{})
+			done := make(chan producerResult, 1)
 
 			go func() {
+				result := producerResult{}
+
 				defer func() {
 					_ = pw.Close()
+					done <- result
 				}()
 
 				for _, reader := range readers {
+					reader := newCancelableReader(reader, cancel, errConsumerClosed)
+
+					var processErr error
 					if xPathQuery != "" {
-						err = utils.XPathQuery(reader, pw, xPathQuery, singleNode, options)
+						processErr = utils.XPathQuery(reader, pw, xPathQuery, singleNode, options)
 					} else if cssQuery != "" {
-						err = utils.CSSQuery(reader, pw, cssQuery, cssAttr, options)
+						processErr = utils.CSSQuery(reader, pw, cssQuery, cssAttr, options)
 					} else {
-						err = processContent(reader, pw, cmd.Flags(), jsonOutputMode, indent, colors)
+						processErr = processContent(reader, pw, cmd.Flags(),
+							jsonOutputMode, indent, colors)
 					}
 
-					if err == nil {
-						matchFound = true
-					} else if errors.Is(err, utils.ErrNoMatch) {
-						err = nil
+					switch {
+					case processErr == nil:
+						result.matched = true
+					case errors.Is(processErr, utils.ErrNoMatch):
+						// A file without matches is not a failure: keep
+						// processing the remaining inputs.
+					case errors.Is(processErr, errConsumerClosed):
+						// The consumer went away: stop reading immediately.
+						return
+					default:
+						select {
+						case <-cancel:
+							// The error was induced by the consumer going
+							// away (it may be wrapped by a parser), ignore it.
+							return
+						default:
+						}
+						// The first real error sticks and must not be
+						// overwritten by any later successful file.
+						if result.err == nil {
+							result.err = processErr
+						}
 					}
-				}
-
-				if err != nil {
-					fmt.Println("Error:", err)
-					os.Exit(1)
 				}
 			}()
 
-			if err = utils.PagerPrint(pr, cmd.OutOrStdout(), getPager(cmd.Flags())); err != nil {
-				return err
+			pagerErr := utils.PagerPrint(pr, cmd.OutOrStdout(), getPager(cmd.Flags()))
+
+			// The consumer is done: unblock pending reads and writes, stop
+			// the producer and wait until it is reclaimed.
+			close(cancel)
+			_ = pr.CloseWithError(errConsumerClosed)
+			result := <-done
+
+			if result.err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "Error: %v\n", result.err)
+				cmd.SilenceErrors = true
+				return result.err
+			}
+
+			if pagerErr != nil {
+				return pagerErr
 			}
 
 			strict, _ := cmd.Flags().GetBool("strict")
-			if strict && (xPathQuery != "" || cssQuery != "") && !matchFound {
+			if strict && (xPathQuery != "" || cssQuery != "") && !result.matched {
 				cmd.SilenceErrors = true
 				return utils.ErrNoMatch
 			}
 
 			return nil
 		},
+	}
+}
+
+// errConsumerClosed breaks the producer out of blocking reads and writes once
+// the output consumer (pager or plain downstream writer) has finished.
+var errConsumerClosed = errors.New("output consumer closed")
+
+// producerResult is the producer goroutine's terminal state.
+type producerResult struct {
+	err     error
+	matched bool
+}
+
+// cancelableReader wraps a reader so blocked and future Read calls return the
+// given cause as soon as the cancel channel is closed. This stops input
+// reading promptly when the consumer goes away, even if the input never
+// reaches EOF. The goroutine waiting for an in-flight blocking read is
+// released once data arrives or the underlying source is closed.
+type cancelableReader struct {
+	reader io.Reader
+	cancel <-chan struct{}
+	cause  error
+}
+
+func newCancelableReader(reader io.Reader, cancel <-chan struct{}, cause error) *cancelableReader {
+	return &cancelableReader{reader: reader, cancel: cancel, cause: cause}
+}
+
+func (r *cancelableReader) Read(p []byte) (int, error) {
+	select {
+	case <-r.cancel:
+		return 0, r.cause
+	default:
+	}
+
+	type readResult struct {
+		n   int
+		err error
+	}
+	readDone := make(chan readResult, 1)
+
+	go func() {
+		n, err := r.reader.Read(p)
+		readDone <- readResult{n: n, err: err}
+	}()
+
+	select {
+	case <-r.cancel:
+		return 0, r.cause
+	case result := <-readDone:
+		return result.n, result.err
 	}
 }
 
